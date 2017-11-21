@@ -17,11 +17,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using System.IO;
 using Mono.Cecil;
+using Mono.Cecil.Pdb;
 using SymbolService.Model;
 
 namespace SymbolService.Controllers
@@ -29,100 +29,102 @@ namespace SymbolService.Controllers
     [Produces("application/json")]
     [Route("api/Methods")]
     public class MethodsController : Controller
-	{
-		[HttpPost]
-		public IEnumerable<MethodInfo> Methods(IEnumerable<IFormFile> files)
-		{
-			try
-			{
-				// TODO: This POST should be binding the file from a multipart/form-data request. But it's not, even though the files do exist in the HttpContext.
-				// TODO: Need to find the issue and fix. It could be an improper boundary format in the request.
-				var hackFiles = HttpContext.Request.Form.Files;
+    {
+        [HttpPost]
+        public IActionResult Methods(IFormFile assemblyFile, IFormFile symbolsFile)
+        {
+            try
+            {
+                if (assemblyFile == null || symbolsFile == null)
+                {
+                    return new BadRequestObjectResult($"You must specify two files with keys named {nameof(assemblyFile)} and {nameof(symbolsFile)}");
+                }
 
-				var assembly = hackFiles.First(file => file.Name == "Assembly");
-				var symbols = hackFiles.First(file => file.Name == "Symbols");
+                var paths = GenerateFilePaths();
+                var assemblyPath = paths.Item1;
+                var symbolsPath = paths.Item2;
 
-				var (assemblyPath, symbolsPath) = GenerateFilePaths();
-				WriteFile(assemblyPath, assembly);
-				WriteFile(symbolsPath, symbols);
+                WriteFile(assemblyPath, assemblyFile);
+                WriteFile(symbolsPath, symbolsFile);
 
-				var module = LoadModule(assemblyPath, symbolsPath);
-				var methodInfos = module.Types.SelectMany(type => type.Methods).Select(method => GetMethodInfo(method));
+                using (var module = LoadModule(assemblyPath, symbolsPath))
+                {
+                    var methodInfos = module.Types.SelectMany(type => type.Methods).Select(GetMethodInfo);
+                    return new JsonResult(methodInfos.ToArray()); // materialize collection prior to module disposal
+                }
+            }
+            catch
+            {
+                return new StatusCodeResult(StatusCodes.Status500InternalServerError);
+            }
+        }
 
-				return methodInfos;
-			}
-			catch
-			{
-				return Enumerable.Empty<MethodInfo>();
-			}
-		}
+        private Tuple<string, string> GenerateFilePaths()
+        {
+            var tempFolder = Path.GetTempPath();
+            var randomFile = Path.GetRandomFileName();
+            var assemblyPath = $"assembly{randomFile}";
+            var symbolsPath = $"symbols{randomFile}";
 
-		private (string assemblyPath, string symbolsPath) GenerateFilePaths()
-		{
-			var tempFolder = Path.GetTempPath();
-			var randomFile = Path.GetRandomFileName();
-			var assemblyPath = $"assembly{randomFile}";
-			var symbolsPath = $"symbols{randomFile}";
-			
-			return (Path.Combine(tempFolder, assemblyPath), Path.Combine(tempFolder, symbolsPath));
-		}
+            return new Tuple<string, string>(Path.Combine(tempFolder, assemblyPath), Path.Combine(tempFolder, symbolsPath));
+        }
 
-		private void WriteFile(string filePath, IFormFile file)
-		{
-			using (var stream = new FileStream(filePath, FileMode.Create))
-			{
-				file.CopyTo(stream);
-			}
-		}
+        private void WriteFile(string filePath, IFormFile file)
+        {
+            using (var stream = new FileStream(filePath, FileMode.Create))
+            {
+                file.CopyTo(stream);
+            }
+        }
 
-		private ModuleDefinition LoadModule(string assemblyPath, string symbolsPath)
-		{
-			using (var symbolsStream = new FileStream(symbolsPath, FileMode.Open))
-			{
-				var parameters = new ReaderParameters
-				{
-					ReadSymbols = true,
-					SymbolStream = symbolsStream
-				};
-				var assembly = AssemblyDefinition.ReadAssembly(assemblyPath, parameters);
+        private ModuleDefinition LoadModule(string assemblyPath, string symbolsPath)
+        {
+            using (var symbolsStream = new FileStream(symbolsPath, FileMode.Open))
+            {
+                var parameters = new ReaderParameters(ReadingMode.Deferred)
+                {
+                    ReadSymbols = true,
+                    SymbolStream = symbolsStream,
+                    SymbolReaderProvider = new PdbReaderProvider() // avoids NotSupportedException in 0.10.0-beta7
+                };
 
-				return assembly.MainModule;
-			}
-		}
+                return ModuleDefinition.ReadModule(assemblyPath, parameters);
+            }
+        }
 
-		private MethodInfo GetMethodInfo(MethodDefinition method)
-		{
-			return new MethodInfo
-			{
-				FullyQualifiedName = method.Name,
-				ContainingClass = method.DeclaringType?.FullName,
-				AccessModifiers = GetAccessModifiers(method),
-				Parameters = GetParameters(method),
-				ReturnType = method.ReturnType.FullName,
-				Instructions = method.Body?.Instructions?.Count ?? 0
-			};
-		}
+        private MethodInfo GetMethodInfo(MethodDefinition method)
+        {
+            return new MethodInfo
+            {
+                FullyQualifiedName = method.Name,
+                ContainingClass = method.DeclaringType?.FullName,
+                AccessModifiers = GetAccessModifiers(method),
+                Parameters = GetParameters(method),
+                ReturnType = method.ReturnType.FullName,
+                Instructions = method.Body?.Instructions?.Count ?? 0
+            };
+        }
 
-		static readonly Dictionary<Modifier, Func<MethodDefinition, Modifier>> AccessModiferQueries = new Dictionary<Modifier, Func<MethodDefinition, Modifier>>()
-		{
-			{ Modifier.PUBLIC, (method) => method.IsPublic ? Modifier.PUBLIC : 0 },
-			{ Modifier.PRIVATE, (method) => method.IsPrivate ? Modifier.PRIVATE : 0 },
-			{ Modifier.ABSTRACT, (method) => method.IsAbstract ? Modifier.ABSTRACT : 0 },
-			{ Modifier.STATIC, (method) => method.IsStatic ? Modifier.STATIC : 0 },
-			{ Modifier.SYNCHRONIZED, (method) => method.IsSynchronized ? Modifier.SYNCHRONIZED : 0 },
-			{ Modifier.FINAL, (method) => method.IsFinal ? Modifier.FINAL : 0 },
-			{ Modifier.PROTECTED, (method) => method.IsFamily ? Modifier.PROTECTED : 0 }
-		};
+        static readonly Dictionary<Modifier, Func<MethodDefinition, Modifier>> AccessModiferQueries = new Dictionary<Modifier, Func<MethodDefinition, Modifier>>()
+        {
+            { Modifier.PUBLIC, (method) => method.IsPublic ? Modifier.PUBLIC : 0 },
+            { Modifier.PRIVATE, (method) => method.IsPrivate ? Modifier.PRIVATE : 0 },
+            { Modifier.ABSTRACT, (method) => method.IsAbstract ? Modifier.ABSTRACT : 0 },
+            { Modifier.STATIC, (method) => method.IsStatic ? Modifier.STATIC : 0 },
+            { Modifier.SYNCHRONIZED, (method) => method.IsSynchronized ? Modifier.SYNCHRONIZED : 0 },
+            { Modifier.FINAL, (method) => method.IsFinal ? Modifier.FINAL : 0 },
+            { Modifier.PROTECTED, (method) => method.IsFamily ? Modifier.PROTECTED : 0 }
+        };
 
-		private int GetAccessModifiers(MethodDefinition method)
-		{
-			return AccessModiferQueries.Values.Select(getModifier => getModifier(method))
-				.Aggregate(0, (previous, next) => previous | (int)next);
-		}
+        private int GetAccessModifiers(MethodDefinition method)
+        {
+            return AccessModiferQueries.Values.Select(getModifier => getModifier(method))
+                .Aggregate(0, (previous, next) => previous | (int)next);
+        }
 
-		private List<String> GetParameters(MethodDefinition method)
-		{
-			return method.Parameters.Select(parameter => parameter.ParameterType.FullName).ToList();
-		}
-	}
+        private List<String> GetParameters(MethodDefinition method)
+        {
+            return method.Parameters.Select(parameter => parameter.ParameterType.FullName).ToList();
+        }
+    }
 }
